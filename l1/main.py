@@ -1,11 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Лабораторная работа №1. Вариант 5.
-Команды: ping, ipconfig, tracert, netstat.
-Оценка: "хорошо" (GUI + удобный вывод).
-Реализация на PySide6.
-"""
-
 import sys
 import re
 import subprocess
@@ -14,42 +6,78 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QSpinBox,
     QTableWidget, QTableWidgetItem, QTextEdit, QComboBox,
-    QMessageBox, QHeaderView, QGroupBox, QFormLayout
+    QMessageBox, QHeaderView, QGroupBox, QFormLayout,
+    QCheckBox, QProgressBar
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 
 
-# ============================================================
-# Вспомогательные функции запуска команд Windows
-# ============================================================
-def run_command(args):
-    """Запускает команду и возвращает (stdout, stderr)."""
-    try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            encoding="cp866",   # кодировка консоли Windows
-            errors="replace",
-            shell=False
-        )
-        return result.stdout, result.stderr
-    except Exception as e:
-        return "", str(e)
+class WorkerThread(QThread):
+    output_ready = Signal(str)
+    error_ready = Signal(str)
+    progress_update = Signal(int)
+    finished_success = Signal()
+
+    def __init__(self, cmd, total_steps=0):
+        super().__init__()
+        self.cmd = cmd
+        self.total_steps = total_steps
+        self.process = None
+        self.is_running = True
+
+    def run(self):
+        try:
+            self.process = subprocess.Popen(
+                self.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="cp866",
+                errors="replace",
+                shell=False
+            )
+
+            stdout_lines = []
+            count = 0
+            for line in self.process.stdout:
+                if not self.is_running:
+                    self.process.terminate()
+                    break
+                stdout_lines.append(line)
+                if self.total_steps > 0:
+                    count += 1
+                    progress = int((count / self.total_steps) * 100)
+                    self.progress_update.emit(min(progress, 100))
+
+            self.process.wait()
+            stderr_output = self.process.stderr.read()
+
+            self.output_ready.emit("".join(stdout_lines))
+            if stderr_output:
+                self.error_ready.emit(stderr_output)
+
+            self.progress_update.emit(100)
+            self.finished_success.emit()
+
+        except Exception as e:
+            self.error_ready.emit(str(e))
+            self.progress_update.emit(100)
+
+    def stop(self):
+        self.is_running = False
+        if self.process:
+            self.process.terminate()
 
 
-# ============================================================
-# Вкладка PING
-# ============================================================
 class PingTab(QWidget):
     def __init__(self):
         super().__init__()
+        self.worker = None
         self.build_ui()
 
     def build_ui(self):
         layout = QVBoxLayout(self)
 
-        # --- Панель параметров ---
         params_box = QGroupBox("Параметры ping")
         form = QFormLayout()
 
@@ -69,23 +97,63 @@ class PingTab(QWidget):
         self.timeout_spin.setValue(1000)
         self.timeout_spin.setSuffix(" мс")
 
+        self.ttl_spin = QSpinBox()
+        self.ttl_spin.setRange(1, 255)
+        self.ttl_spin.setValue(128)
+
+        self.tos_spin = QSpinBox()
+        self.tos_spin.setRange(0, 255)
+        self.tos_spin.setValue(0)
+
+        self.route_spin = QSpinBox()
+        self.route_spin.setRange(1, 9)
+        self.route_spin.setValue(1)
+
+        self.timestamp_spin = QSpinBox()
+        self.timestamp_spin.setRange(0, 4)
+        self.timestamp_spin.setValue(0)
+
+        self.j_list_edit = QLineEdit()
+        self.j_list_edit.setPlaceholderText("192.168.1.1,192.168.1.2")
+
+        self.k_list_edit = QLineEdit()
+        self.k_list_edit.setPlaceholderText("192.168.1.1,192.168.1.2")
+
+        self.cb_t = QCheckBox("Непрерывно (-t)")
+        self.cb_a = QCheckBox("Разрешать имена (-a)")
+        self.cb_f = QCheckBox("Не фрагментировать (-f)")
+
         form.addRow("Узел:", self.host_edit)
         form.addRow("Число запросов (-n):", self.count_spin)
         form.addRow("Размер пакета (-l):", self.size_spin)
         form.addRow("Таймаут (-w):", self.timeout_spin)
+        form.addRow("Время жизни TTL (-i):", self.ttl_spin)
+        form.addRow("Тип службы TOS (-v):", self.tos_spin)
+        form.addRow("Запись маршрута (-r):", self.route_spin)
+        form.addRow("Метка времени (-s):", self.timestamp_spin)
+        form.addRow("Список узлов (-j):", self.j_list_edit)
+        form.addRow("Список узлов (-k):", self.k_list_edit)
+        form.addRow(self.cb_t)
+        form.addRow(self.cb_a)
+        form.addRow(self.cb_f)
         params_box.setLayout(form)
 
-        # --- Кнопки ---
         btn_layout = QHBoxLayout()
         self.run_btn = QPushButton("Запустить ping")
         self.run_btn.clicked.connect(self.run_ping)
+        self.stop_btn = QPushButton("Стоп")
+        self.stop_btn.clicked.connect(self.stop_ping)
+        self.stop_btn.setEnabled(False)
         self.clear_btn = QPushButton("Очистить")
         self.clear_btn.clicked.connect(self.clear_all)
         btn_layout.addWidget(self.run_btn)
+        btn_layout.addWidget(self.stop_btn)
         btn_layout.addWidget(self.clear_btn)
         btn_layout.addStretch()
 
-        # --- Таблица результатов ---
+        self.progress = QProgressBar()
+        self.progress.setValue(0)
+
         self.table = QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(
@@ -93,13 +161,13 @@ class PingTab(QWidget):
         )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
-        # --- Итоговая статистика ---
         self.stats = QTextEdit()
         self.stats.setReadOnly(True)
         self.stats.setMaximumHeight(120)
 
         layout.addWidget(params_box)
         layout.addLayout(btn_layout)
+        layout.addWidget(self.progress)
         layout.addWidget(QLabel("Ответы (по строкам):"))
         layout.addWidget(self.table)
         layout.addWidget(QLabel("Статистика:"))
@@ -113,20 +181,56 @@ class PingTab(QWidget):
 
         self.table.setRowCount(0)
         self.stats.clear()
+        self.progress.setValue(0)
 
-        cmd = [
-            "ping", "-n", str(self.count_spin.value()),
-            "-l", str(self.size_spin.value()),
-            "-w", str(self.timeout_spin.value()),
-            host
-        ]
+        cmd = ["ping"]
+        if self.cb_t.isChecked():
+            cmd.append("-t")
+        if self.cb_a.isChecked():
+            cmd.append("-a")
+        if self.cb_f.isChecked():
+            cmd.append("-f")
+
+        cmd += ["-n", str(self.count_spin.value())]
+        cmd += ["-l", str(self.size_spin.value())]
+        cmd += ["-w", str(self.timeout_spin.value())]
+        cmd += ["-i", str(self.ttl_spin.value())]
+        cmd += ["-v", str(self.tos_spin.value())]
+
+        if self.route_spin.value() > 1:
+            cmd += ["-r", str(self.route_spin.value())]
+        if self.timestamp_spin.value() > 0:
+            cmd += ["-s", str(self.timestamp_spin.value())]
+
+        j_text = self.j_list_edit.text().strip()
+        if j_text:
+            cmd += ["-j", j_text]
+
+        k_text = self.k_list_edit.text().strip()
+        if k_text:
+            cmd += ["-k", k_text]
+
+        cmd.append(host)
+
         self.stats.append(f"Команда: {' '.join(cmd)}\n")
 
-        out, err = run_command(cmd)
+        total = 0 if self.cb_t.isChecked() else self.count_spin.value()
+        self.worker = WorkerThread(cmd, total_steps=total)
+        self.worker.output_ready.connect(self.on_output)
+        self.worker.error_ready.connect(self.on_error)
+        self.worker.progress_update.connect(self.progress.setValue)
+        self.worker.finished_success.connect(self.on_finished)
 
-        # Парсим строки ответов
-        # Рус.: "Ответ от 8.8.8.8: число байт=32 время=15мс TTL=117"
-        # Англ.: "Reply from 8.8.8.8: bytes=32 time=15ms TTL=117"
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.worker.start()
+
+    def stop_ping(self):
+        if self.worker:
+            self.worker.stop()
+            self.stop_btn.setEnabled(False)
+
+    def on_output(self, out):
         row = 0
         pattern = re.compile(
             r"(?:Ответ от|Reply from)\s+([\d\.]+).*?"
@@ -148,7 +252,6 @@ class PingTab(QWidget):
                 self.table.setItem(row, 4, QTableWidgetItem(ttl))
                 row += 1
 
-        # Если строки ответов не распознались (таймауты)
         if row == 0:
             for line in out.splitlines():
                 if "Превышен интервал" in line or "Request timed out" in line:
@@ -160,7 +263,6 @@ class PingTab(QWidget):
                     self.table.setItem(row, 4, QTableWidgetItem("-"))
                     row += 1
 
-        # Статистика — выводим из хвоста вывода ping
         stats_lines = []
         for line in out.splitlines():
             if any(k in line for k in [
@@ -176,20 +278,23 @@ class PingTab(QWidget):
         else:
             self.stats.append(out[-800:])
 
-        if err.strip():
-            self.stats.append("\n[stderr]\n" + err)
+    def on_error(self, err):
+        self.stats.append("\n[stderr]\n" + err)
+
+    def on_finished(self):
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
     def clear_all(self):
         self.table.setRowCount(0)
         self.stats.clear()
+        self.progress.setValue(0)
 
 
-# ============================================================
-# Вкладка IPCONFIG (результаты по каждому интерфейсу — на отдельной вкладке)
-# ============================================================
 class IpconfigTab(QWidget):
     def __init__(self):
         super().__init__()
+        self.worker = None
         self.build_ui()
 
     def build_ui(self):
@@ -197,7 +302,23 @@ class IpconfigTab(QWidget):
 
         top = QHBoxLayout()
         self.all_check = QComboBox()
-        self.all_check.addItems(["Обычный вывод", "Полный вывод (/all)"])
+        self.all_check.addItems([
+            "Обычный вывод",
+            "Полный вывод (/all)",
+            "Сбросить кэш DNS (/flushdns)",
+            "Показать кэш DNS (/displaydns)",
+            "Обновить DHCP (/renew)",
+            "Освободить DHCP (/release)",
+            "Обновить регистрацию DNS (/registerdns)",
+            "Показать класс DHCP (/showclassid)",
+            "Установить класс DHCP (/setclassid)"
+        ])
+
+        self.adapter_edit = QLineEdit()
+        self.adapter_edit.setPlaceholderText("Имя адаптера (для /renew, /release)")
+        self.class_edit = QLineEdit()
+        self.class_edit.setPlaceholderText("Код класса (для /setclassid)")
+
         self.run_btn = QPushButton("Выполнить ipconfig")
         self.run_btn.clicked.connect(self.run_ipconfig)
         self.clear_btn = QPushButton("Очистить")
@@ -205,35 +326,86 @@ class IpconfigTab(QWidget):
 
         top.addWidget(QLabel("Режим:"))
         top.addWidget(self.all_check)
+        top.addWidget(self.adapter_edit)
+        top.addWidget(self.class_edit)
         top.addWidget(self.run_btn)
         top.addWidget(self.clear_btn)
         top.addStretch()
 
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setVisible(False)
+
         self.tabs = QTabWidget()
 
         layout.addLayout(top)
+        layout.addWidget(self.progress)
         layout.addWidget(self.tabs)
 
     def run_ipconfig(self):
         self.tabs.clear()
         cmd = ["ipconfig"]
-        if self.all_check.currentIndex() == 1:
+        idx = self.all_check.currentIndex()
+        adapter = self.adapter_edit.text().strip()
+        class_id = self.class_edit.text().strip()
+
+        if idx == 1:
             cmd.append("/all")
+        elif idx == 2:
+            cmd.append("/flushdns")
+        elif idx == 3:
+            cmd.append("/displaydns")
+        elif idx == 4:
+            cmd.append("/renew")
+            if adapter: cmd.append(adapter)
+        elif idx == 5:
+            cmd.append("/release")
+            if adapter: cmd.append(adapter)
+        elif idx == 6:
+            cmd.append("/registerdns")
+        elif idx == 7:
+            cmd.append("/showclassid")
+            if adapter: cmd.append(adapter)
+        elif idx == 8:
+            cmd.append("/setclassid")
+            if adapter: cmd.append(adapter)
+            if class_id: cmd.append(class_id)
 
-        out, err = run_command(cmd)
-        if err.strip():
-            QMessageBox.warning(self, "Ошибка", err)
+        self.run_btn.setEnabled(False)
+        self.progress.setVisible(True)
 
-        # Разбиваем вывод на блоки по адаптерам
-        blocks = re.split(r"\n\s*\n", out.strip())
+        self.worker = WorkerThread(cmd)
+        self.worker.output_ready.connect(self.on_output)
+        self.worker.error_ready.connect(lambda e: QMessageBox.warning(self, "Ошибка", e))
+        self.worker.finished_success.connect(self.on_finished)
+        self.worker.start()
+
+    def on_output(self, out):
+        lines = out.splitlines()
         adapter_blocks = []
-        for b in blocks:
-            b = b.strip()
-            if not b:
-                continue
-            first_line = b.splitlines()[0]
-            if first_line and not first_line.startswith(" ") and first_line.endswith(":"):
-                adapter_blocks.append(b)
+        current_name = None
+        current_lines = []
+
+        header_re = re.compile(
+            r"^(Адаптер\s+.+|Ethernet adapter\s+.+|"
+            r"Tunnel adapter\s+.+|Беспроводная сеть.*|"
+            r"Wireless LAN adapter\s+.+|"
+            r"Неизвестный адаптер\s+.+|Unknown adapter\s+.+)\s*:\s*$",
+            re.IGNORECASE
+        )
+
+        for line in lines:
+            if header_re.match(line.strip()) and not line.startswith(" "):
+                if current_name is not None:
+                    adapter_blocks.append((current_name, current_lines))
+                current_name = line.strip().rstrip(":")
+                current_lines = []
+            else:
+                if current_name is not None:
+                    current_lines.append(line)
+
+        if current_name is not None:
+            adapter_blocks.append((current_name, current_lines))
 
         if not adapter_blocks:
             tab = QTextEdit()
@@ -242,23 +414,39 @@ class IpconfigTab(QWidget):
             self.tabs.addTab(tab, "Весь вывод")
             return
 
-        for block in adapter_blocks:
-            name = block.splitlines()[0].rstrip(":").strip()
+        used_names = {}
+        for name, block_lines in adapter_blocks:
+            while block_lines and not block_lines[0].strip():
+                block_lines.pop(0)
+            while block_lines and not block_lines[-1].strip():
+                block_lines.pop()
+
+            text = name + ":\n" + "\n".join(block_lines)
             tab = QTextEdit()
             tab.setReadOnly(True)
-            tab.setPlainText(block)
-            self.tabs.addTab(tab, name[:30])
+            tab.setPlainText(text)
+
+            short = name[:30]
+            if short in used_names:
+                used_names[short] += 1
+                short = f"{short} ({used_names[short]})"
+            else:
+                used_names[short] = 1
+
+            self.tabs.addTab(tab, short)
+
+    def on_finished(self):
+        self.run_btn.setEnabled(True)
+        self.progress.setVisible(False)
 
     def clear_all(self):
         self.tabs.clear()
 
 
-# ============================================================
-# Вкладка TRACERT
-# ============================================================
 class TracertTab(QWidget):
     def __init__(self):
         super().__init__()
+        self.worker = None
         self.build_ui()
 
     def build_ui(self):
@@ -297,6 +485,10 @@ class TracertTab(QWidget):
         btn_layout.addWidget(self.clear_btn)
         btn_layout.addStretch()
 
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setVisible(False)
+
         self.table = QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(
@@ -310,6 +502,7 @@ class TracertTab(QWidget):
 
         layout.addWidget(params_box)
         layout.addLayout(btn_layout)
+        layout.addWidget(self.progress)
         layout.addWidget(QLabel("Маршрут:"))
         layout.addWidget(self.table)
         layout.addWidget(QLabel("Полный вывод:"))
@@ -332,16 +525,24 @@ class TracertTab(QWidget):
         cmd.append(host)
 
         self.raw.append(f"Команда: {' '.join(cmd)}\n")
-        out, err = run_command(cmd)
+
+        self.run_btn.setEnabled(False)
+        self.progress.setVisible(True)
+
+        self.worker = WorkerThread(cmd)
+        self.worker.output_ready.connect(self.on_output)
+        self.worker.error_ready.connect(lambda e: self.raw.append("[stderr]\n" + e))
+        self.worker.finished_success.connect(self.on_finished)
+        self.worker.start()
+
+    def on_output(self, out):
         self.raw.append(out)
-        if err.strip():
-            self.raw.append("[stderr]\n" + err)
 
         row = 0
         pattern = re.compile(
-            r"^\s*(\d+)\s+"
-            r"(?:<?\s*\d+\s*ms\s+){1,3}"
-            r"(.+?)\s*$"
+            r"^\s*(\d+)\s+"  # номер прыжка
+            r"(?:<?\s*\d+\s*ms\s+){1,3}"  # время отклика
+            r"(.+?)\s*$"  # ip узла
         )
         rtt_pattern = re.compile(r"<?\s*(\d+)\s*ms")
 
@@ -362,17 +563,19 @@ class TracertTab(QWidget):
             self.table.setItem(row, 4, QTableWidgetItem(rtts[2]))
             row += 1
 
+    def on_finished(self):
+        self.run_btn.setEnabled(True)
+        self.progress.setVisible(False)
+
     def clear_all(self):
         self.table.setRowCount(0)
         self.raw.clear()
 
 
-# ============================================================
-# Вкладка NETSTAT
-# ============================================================
 class NetstatTab(QWidget):
     def __init__(self):
         super().__init__()
+        self.worker = None
         self.build_ui()
 
     def build_ui(self):
@@ -402,6 +605,10 @@ class NetstatTab(QWidget):
         btn_layout.addWidget(self.clear_btn)
         btn_layout.addStretch()
 
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setVisible(False)
+
         self.table = QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(
@@ -414,6 +621,7 @@ class NetstatTab(QWidget):
 
         layout.addWidget(params_box)
         layout.addLayout(btn_layout)
+        layout.addWidget(self.progress)
         layout.addWidget(QLabel("Соединения:"))
         layout.addWidget(self.table)
         layout.addWidget(QLabel("Полный вывод:"))
@@ -439,10 +647,17 @@ class NetstatTab(QWidget):
         self.raw.clear()
         self.raw.append(f"Команда: {' '.join(cmd)}\n")
 
-        out, err = run_command(cmd)
+        self.run_btn.setEnabled(False)
+        self.progress.setVisible(True)
+
+        self.worker = WorkerThread(cmd)
+        self.worker.output_ready.connect(lambda out: self.on_output(out, idx))
+        self.worker.error_ready.connect(lambda e: self.raw.append("[stderr]\n" + e))
+        self.worker.finished_success.connect(self.on_finished)
+        self.worker.start()
+
+    def on_output(self, out, idx):
         self.raw.append(out)
-        if err.strip():
-            self.raw.append("[stderr]\n" + err)
 
         if idx not in (0, 1, 5):
             return
@@ -478,18 +693,19 @@ class NetstatTab(QWidget):
             self.table.setItem(row, 4, QTableWidgetItem(pid))
             row += 1
 
+    def on_finished(self):
+        self.run_btn.setEnabled(True)
+        self.progress.setVisible(False)
+
     def clear_all(self):
         self.table.setRowCount(0)
         self.raw.clear()
 
 
-# ============================================================
-# Главное окно
-# ============================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ЛР №1 — Вариант 5: ping, ipconfig, tracert, netstat")
+        self.setWindowTitle("lab1")
         self.resize(1000, 700)
 
         tabs = QTabWidget()
@@ -501,7 +717,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(tabs)
 
 
-# ============================================================
 def main():
     app = QApplication(sys.argv)
     win = MainWindow()
